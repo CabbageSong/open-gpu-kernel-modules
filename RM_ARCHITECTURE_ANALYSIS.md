@@ -1257,6 +1257,282 @@ void pmaRegmapPrint(PMA_REGMAP *pMap) {
 }
 ```
 
+### GPU 架构和 PMA 使用情况
+
+#### PMA 适用的 GPU 架构
+
+根据代码分析，**Multi-layer Bitmap PMA 算法从 Pascal 架构开始引入**，并在所有现代 NVIDIA GPU 上使用：
+
+**PMA 支持的架构**:
+
+| GPU 架构 | 代表产品 | PMA 支持 | Heap 支持 | 备注 |
+|---------|---------|---------|----------|------|
+| **Maxwell** (GM10X/GM20X) | GTX 900 系列 | ❌ | ✅ | 仅 Heap，无 PMA |
+| **Pascal** (GP10X) | GTX 1000 系列, P100 | ✅ | ✅ | **首次引入 PMA** |
+| **Volta** (GV10X) | V100, Titan V | ✅ | ✅ | PMA 完全支持 |
+| **Turing** (TU10X) | RTX 20 系列, T4 | ✅ | ✅ | PMA 为主 |
+| **Ampere** (GA10X) | RTX 30 系列, A100 | ✅ | ✅ | PMA 主导 |
+| **Ada Lovelace** (AD10X) | RTX 40 系列, L40 | ✅ | ❌ | **仅 PMA，废弃 Heap** |
+| **Hopper** (GH10X) | H100 | ✅ | ❌ | 仅 PMA |
+| **Blackwell** (GB10X) | B100 (未发布) | ✅ | ❌ | 仅 PMA |
+
+**关键里程碑**:
+- **Pascal (2016)**: PMA 首次引入，与 Heap 共存
+- **Ada Lovelace (2022)**: 完全移除 Heap，仅使用 PMA
+- **现代 GPU**: 从 Ada/Hopper 开始，**100% 使用 PMA Multi-layer Bitmap**
+
+#### 代码位置详解
+
+**1. PMA 核心算法实现**:
+```
+src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/
+├── phys_mem_allocator.c          // PMA 主逻辑 (3000+ 行)
+├── phys_mem_allocator_util.c     // 工具函数
+├── regmap.c                      // 位图算法核心 (1800+ 行) ★★★
+├── numa.c                        // NUMA 支持
+└── addrtree.c                    // 地址树管理
+```
+
+**核心函数位置**:
+```c
+// 位图分配算法 - regmap.c
+pmaRegmapScanContiguous()         // 行 715-907: 连续分配
+pmaRegmapScanDiscontiguous()      // 行 911-1256: 非连续分配
+_checkOne()                       // 行 128-201: 快速验证连续块
+maxZerosGet()                     // 行 72-126: 最长零序列查找
+
+// PMA 初始化和管理 - phys_mem_allocator.c
+pmaInitialize()                   // 行 109: PMA 初始化入口
+pmaAllocatePages()                // 行 645: 页面分配入口
+pmaFreePages()                    // 行 1470: 页面释放
+pmaRegisterRegion()               // 行 242: 注册内存区域
+```
+
+**2. PMA 数据结构定义**:
+```
+src/nvidia/inc/kernel/gpu/mem_mgr/phys_mem_allocator/
+├── regmap.h                      // 位图结构定义 ★
+├── map_defines.h                 // 状态/属性定义 ★
+└── phys_mem_allocator.h          // PMA 公共接口
+```
+
+**核心数据结构**:
+```c
+// map_defines.h:46-54
+typedef struct pma_regmap {
+    NvU64 totalFrames;              // 总帧数
+    NvU64 mapLength;                // 位图长度
+    NvU64 *map[PMA_BITS_PER_PAGE];  // 8 层位图数组 ★★★
+    NvU64 frameEvictionsInProcess;  // 驱逐计数
+    PMA_STATS *pPmaStats;           // 统计信息
+    NvBool bProtected;              // 保护内存标志
+} PMA_REGMAP;
+
+// map_defines.h:68-88
+#define MAP_IDX_ALLOC_UNPIN 0  // 已分配-未锁定
+#define MAP_IDX_ALLOC_PIN   1  // 已分配-已锁定
+#define MAP_IDX_EVICTING    2  // 正在驱逐
+#define MAP_IDX_SCRUBBING   3  // 正在清零
+#define MAP_IDX_PERSISTENT  4  // 持久化
+#define MAP_IDX_NUMA_REUSE  5  // NUMA 重用
+#define MAP_IDX_BLACKLIST   6  // 黑名单
+#define MAP_IDX_LOCALIZED   7  // 本地化
+```
+
+**3. Heap 实现 (旧架构)**:
+```
+src/nvidia/src/kernel/gpu/mem_mgr/
+└── heap.c                        // Heap 分配器 (4200+ 行)
+```
+
+**Heap 核心函数**:
+```c
+heapAlloc()                       // 行 3715: Heap 分配入口
+heapFree()                        // 行 3899: Heap 释放
+_heapAllocNoncontig()             // 行 2413: 非连续分配
+```
+
+**4. PMA vs Heap 选择逻辑**:
+```
+src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
+```
+
+**关键函数和行号**:
+```c
+// mem_mgr.c:1959-2007
+memmgrSetPlatformPmaSupport_IMPL() {
+    // 检查平台是否支持 PMA
+    if (RMCFG_FEATURE_PLATFORM_UNIX || 
+        RMCFG_FEATURE_PLATFORM_MODS || 
+        RMCFG_FEATURE_PLATFORM_WINDOWS) {
+        pMemoryManager->bPmaSupportedOnPlatform = NV_TRUE;
+    }
+}
+
+// mem_mgr.c:275-285
+// 读取注册表覆盖 PMA 设置
+if (osReadRegistryDword(pGpu, NV_REG_STR_RM_ENABLE_PMA, &data32) == NV_OK) {
+    if (data32 == NV_REG_STR_RM_ENABLE_PMA_YES) {
+        pMemoryManager->bPmaEnabled = NV_TRUE;
+    } else {
+        pMemoryManager->bPmaEnabled = NV_FALSE;
+    }
+}
+
+// mem_mgr.c:3290-3326
+// PMA 初始化
+memmgrPmaInitialize_IMPL() {
+    NvU32 pmaInitFlags = PMA_INIT_NONE;
+    
+    if (persistentFlag) {
+        pmaInitFlags |= PMA_INIT_FORCE_PERSISTENCE;
+    }
+    if (scrubOnFree) {
+        pmaInitFlags |= PMA_INIT_SCRUB_ON_FREE;
+    }
+    if (numaEnabled) {
+        pmaInitFlags |= PMA_INIT_NUMA;
+        pmaInitFlags |= PMA_INIT_NUMA_AUTO_ONLINE;
+    }
+    
+    status = pmaInitialize(ppPma, pmaInitFlags);
+}
+
+// heap.c:561, 622, 749, 3752, 3833, 3949, 4100
+// 多处检查: memmgrIsPmaInitialized(pMemoryManager)
+// 如果 PMA 已初始化，优先使用 PMA 而非 Heap
+```
+
+**5. 架构特定实现**:
+```
+src/nvidia/src/kernel/gpu/mem_mgr/arch/
+├── pascal/mem_mgr_gp100.c        // Pascal PMA 支持
+├── volta/mem_mgr_gv100.c         // Volta PMA 支持
+├── turing/mem_mgr_tu102.c        // Turing PMA 支持
+├── ampere/mem_mgr_ga100.c        // Ampere PMA 支持
+├── ada/mem_mgr_ad102.c           // Ada PMA (仅 PMA)
+├── ada/mem_mgr_ad104.c           // Ada PMA (仅 PMA)
+├── hopper/                       // Hopper PMA (仅 PMA)
+└── blackwell/                    // Blackwell PMA (仅 PMA)
+```
+
+**特定优化**:
+```c
+// ada/mem_mgr_ad102.c:34
+NvU64 memmgrGetMaxContextSize_AD102() {
+    size = memmgrGetMaxContextSize_GA100();  // 继承 Ampere
+    if (RMCFG_FEATURE_PLATFORM_MODS) {
+        size += 64 * 1024 * 1024;  // +64MB for MODS
+    }
+    return size;
+}
+
+// ada/mem_mgr_ad104.c:35
+NvU64 memmgrGetMaxContextSize_AD104() {
+    size = memmgrGetMaxContextSize_GA100();
+    kmemsysGetUsableFbSize_HAL(pGpu, pKernelMemorySystem, &fbSize);
+    if ((fbSize >> 30) < 12) {  // < 12GB
+        size += 10 * 1024 * 1024;  // +10MB 缓冲
+    }
+    if (RMCFG_FEATURE_PLATFORM_MODS) {
+        size += 64 * 1024 * 1024;
+    }
+    return size;
+}
+```
+
+**6. 位图操作加速**:
+```
+src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/regmap.c
+```
+
+**硬件加速函数**:
+```c
+// regmap.c:84, 110
+portUtilCountLeadingZeros64(bits)   // CLZ 指令
+portUtilCountTrailingZeros64(bits)  // CTZ 指令
+
+// 使用示例 - regmap.c:72-126
+static NvU32 maxZerosGet(NvU64 bits, NvU32* pStartPos) {
+    if (bits == 0) return 64;
+    
+    // 硬件加速计算前导零
+    leadingZeros = portUtilCountLeadingZeros64(bits);
+    maxZeros = leadingZeros;
+    
+    while (currentPos < 64) {
+        // 硬件加速跳过 1
+        ones = portUtilCountTrailingZeros64(~remainingBits);
+        currentPos += ones;
+        
+        // 硬件加速计数 0
+        zeros = portUtilCountTrailingZeros64(remainingBits);
+        if (zeros > maxZeros) {
+            maxZeros = zeros;
+            bestStartPos = currentPos;
+        }
+        currentPos += zeros;
+    }
+    return maxZeros;
+}
+```
+
+**7. VIDMEM 分配调用路径**:
+```
+用户态: cudaMalloc() / cuMemAlloc()
+  ↓
+KMD 入口:
+src/nvidia/src/kernel/mem_mgr/video_mem.c
+├── vidmemConstruct_IMPL()        // 行 94: 构造函数
+├── vidmemAllocResources()        // 行 321: 分配资源
+└── _vidmemAllocResources()       // 行 965: 内部实现
+      ↓
+      if (memmgrIsPmaInitialized()) {
+          // 使用 PMA
+          pmaAllocatePages(pPma, pageCount, pageSize, ...)
+      } else {
+          // 使用 Heap (仅旧架构)
+          heapAlloc(pHeap, ...)
+      }
+      ↓
+      if (GSP-RM) {
+          NV_RM_RPC_ALLOC_VIDMEM(pGpu, ...)  // RPC 同步
+      }
+```
+
+**8. 调试和监控代码位置**:
+```c
+// phys_mem_allocator.c:2150
+pmaQueryConfigs(PMA *pPma, NvU32 *pConfig) {
+    // 查询 PMA 配置
+}
+
+// regmap.c:51
+void pmaRegmapPrint(PMA_REGMAP *pMap) {
+    // 打印位图状态 (调试用)
+    for (j = 0; j < PMA_BITS_PER_PAGE; j++) {
+        for (i = 0; i < pMap->mapLength; i+=4) {
+            NV_PRINTF("map[%d]: %llx\n", i, pMap->map[j][i]);
+        }
+    }
+}
+
+// regmap.c:1714
+void pmaRegmapGetLargestFree(void *pMap, NvU64 *pLargestFree, NvU64 *pLargestFreeOffset) {
+    // 获取最大空闲块
+}
+```
+
+**9. 寄存器控制**:
+```
+注册表键值 (Windows) / modprobe 参数 (Linux):
+
+NV_REG_STR_RM_ENABLE_PMA=1        // 强制启用 PMA
+NV_REG_STR_RM_ENABLE_PMA=0        // 强制禁用 PMA (仅旧架构)
+
+代码位置: mem_mgr.c:275-285
+```
+
 ### 总结
 
 NVIDIA 的 PMA (Physical Memory Allocator) 是一个**自定义的多层位图分配器**，专为 GPU VRAM 的特性优化：
@@ -1271,6 +1547,11 @@ NVIDIA 的 PMA (Physical Memory Allocator) 是一个**自定义的多层位图�
 **优于传统算法**:
 - **vs Buddy System**: 避免分裂/合并，碎片可见，驱逐友好
 - **vs Slab**: 支持大块分配，无内部碎片，适合 GPU 场景
+
+**适用范围**:
+- **Pascal ~ Ampere** (2016-2022): PMA 与 Heap 共存，PMA 优先
+- **Ada / Hopper / Blackwell** (2022+): **仅 PMA**，完全移除 Heap
+- **所有现代 NVIDIA GPU** (Pascal+) 都使用 PMA Multi-layer Bitmap
 
 PMA 是针对 **HBM/GDDR 高带宽内存**和 **CUDA 计算负载**专门设计的高性能内存管理算法。
 
