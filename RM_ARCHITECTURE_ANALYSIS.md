@@ -640,6 +640,189 @@ NV_MEMORY_ALLOCATION_PARAMS {
 - `NVOS32_ATTR_PHYSICALITY_NONCONTIGUOUS` - 物理非连续
 - `NVOS32_ATTR_PAGE_SIZE_*` - 页面大小选择
 
+## CUDA 计算的显存分配机制
+
+### CUDA 显存分配的执行位置
+
+基于对代码的分析，**CUDA 计算相关的显存申请主要在 KMD (内核模式驱动) 中进行分配和管理**。
+
+#### 分配流程概述
+
+1. **用户态调用**:
+   ```
+   CUDA Runtime (libcuda.so) 
+     └─> NvRmAlloc() / cuMemAlloc()
+         └─> ioctl() 系统调用到 KMD
+   ```
+
+2. **KMD 处理** (`vidmemConstruct_IMPL`):
+   ```c
+   vidmemConstruct_IMPL()
+     └─> vidmemAllocResources()
+         └─> PMA (Physical Memory Allocator)
+             └─> pmaAllocatePages()  // 在 KMD 中执行
+   ```
+
+3. **GSP-RM 同步** (如果启用):
+   ```c
+   NV_RM_RPC_ALLOC_VIDMEM(pGpu, ...)
+     └─> RPC 调用通知 GSP-RM
+         └─> GSP-RM 更新硬件状态
+   ```
+
+#### 关键点
+
+- **分配决策**: 在 **KMD** 中进行
+- **内存管理**: **PMA (KMD 组件)** 管理显存分配
+- **元数据**: 存储在 **KMD 的系统内存**中
+- **硬件操作**: GSP-RM (如果启用) 负责硬件配置
+- **同步机制**: KMD 通过 RPC 与 GSP-RM 保持状态同步
+
+**结论**: CUDA 显存分配的**核心逻辑和资源管理在 KMD 中完成**，GSP-RM 仅在启用时负责底层硬件控制和配置。
+
+## GPFIFO 工作提交机制详解
+
+### GPFIFO 是什么？
+
+GPFIFO (Graphics Processing FIFO) 是 GPU 命令队列，用于将用户态准备的工作 (pushbuffer) 提交给 GPU 执行。
+
+### 提交机制演进
+
+#### 1. Pre-Volta 架构 (传统方式)
+
+**流程**: 用户态 → KMD → 固件
+
+```
+用户态:
+  1. 准备 pushbuffer (GPU 命令)
+  2. 填充 GPFIFO entry
+  3. ioctl(UPDATE_GPPUT) 到 KMD
+
+KMD:
+  4. 验证请求
+  5. 更新 GPU_PUT 寄存器
+  6. 通知 GPU HOST 引擎
+
+GPU HOST:
+  7. 从 GPFIFO 读取条目
+  8. 执行 pushbuffer 命令
+```
+
+**代码位置**: `src/nvidia/src/kernel/gpu/mem_mgr/channel_utils.c:454`
+
+#### 2. Volta+ 架构 (Usermode Submission)
+
+**流程**: 用户态直接 trigger → 固件 (绕过 KMD)
+
+**核心机制 - Doorbell Register**:
+
+```c
+// 用户态可以直接写入映射的 doorbell 寄存器
+// src/nvidia/src/kernel/rmapi/nv_gpu_ops.c:5597
+// "In Volta+, a channel can submit work by 'ringing a doorbell' 
+//  on the gpu after updating the GP_PUT."
+```
+
+**详细流程**:
+
+```
+初始化阶段 (通过 KMD):
+  1. 分配 Channel
+  2. 创建 GPFIFO
+  3. 映射 Usermode Region (doorbell)
+  4. 获取 Work Submit Token
+
+运行时提交 (用户态直接操作):
+  5. 用户态准备 pushbuffer
+  6. 填充 GPFIFO entry
+  7. 更新 GP_PUT (用户态写 USERD)
+  8. 写 doorbell 寄存器 (携带 token)
+     └─> 直接触发 GPU HOST 引擎
+  
+GPU 侧:
+  9. HOST 引擎检测 doorbell 中断
+  10. 读取 GPFIFO + pushbuffer
+  11. 调度执行
+```
+
+**关键代码**:
+
+```c
+// Usermode 区域映射
+// src/nvidia/src/kernel/rmapi/nv_gpu_ops.c:5653
+channel->workSubmissionOffset = 
+    (NvU32*)((NvU8*)rmSubDevice->clientRegionMapping + 
+             NVC361_NOTIFY_CHANNEL_PENDING);
+
+channel->workSubmissionToken = params.workSubmitToken;
+
+// 用户态直接写 doorbell
+// (用户空间库代码，不在内核源码中)
+*workSubmissionOffset = workSubmissionToken;
+```
+
+**GSP-RM 场景的特殊处理**:
+
+```c
+// src/nvidia/src/kernel/gpu/fifo/arch/ampere/kernel_fifo_ga100.c:975
+// "Updating the usermode doorbell is different for CPU vs. GSP."
+
+if (!RMCFG_FEATURE_PLATFORM_GSP) {
+    // CPU-RM: 直接更新寄存器
+    kfifoUpdateUsermodeDoorbell_HAL(...);
+} else {
+    // GSP-RM: 通过内部机制触发
+    kfifoUpdateInternalDoorbellForUsermode_HAL(...);
+}
+```
+
+### 两种机制对比
+
+| 特性 | Pre-Volta | Volta+ (Usermode) |
+|------|-----------|-------------------|
+| **提交路径** | 用户态 → KMD → GPU | 用户态 → GPU (直接) |
+| **KMD 参与** | 每次都需要 | 仅初始化 |
+| **延迟** | 较高 (系统调用) | 极低 (直接写寄存器) |
+| **吞吐量** | 受 ioctl 限制 | 极高 |
+| **安全性** | KMD 验证 | Token 验证 |
+| **适用场景** | 老旧 GPU | Volta/Turing/Ampere/Hopper+ |
+| **CUDA 使用** | CUDA < 9.0 | CUDA 9.0+ |
+
+### CUDA 与 GPFIFO
+
+**CUDA 应用的工作提交流程**:
+
+```
+CUDA Kernel Launch:
+  1. CUDA Runtime 准备kernel参数
+  2. 生成 GPU 命令到 pushbuffer
+  3. 填充 GPFIFO entry
+  4. Volta+: 直接写 doorbell (零系统调用)
+     Pre-Volta: ioctl 到 KMD
+  5. GPU 从 GPFIFO 读取并执行
+```
+
+**性能优势**:
+
+- **Volta+ 的 usermode submission** 消除了内核态切换开销
+- 适合高频率的小 kernel 启动场景
+- 显著降低 CPU-GPU 同步延迟
+
+### 代码路径总结
+
+**用户态映射**:
+- `src/nvidia/src/kernel/rmapi/nv_gpu_ops.c` - UVM/CUDA GPU Ops
+- `src/nvidia/src/kernel/gpu/fifo/usermode_api.c` - Usermode API
+
+**GPFIFO 管理**:
+- `src/nvidia/src/kernel/gpu/mem_mgr/channel_utils.c` - GPFIFO 填充
+- `src/nvidia/src/kernel/gpu/fifo/kernel_channel.c` - Channel 管理
+
+**Doorbell 实现**:
+- `src/nvidia/src/kernel/gpu/fifo/arch/volta/kernel_fifo_gv100.c` - Volta
+- `src/nvidia/src/kernel/gpu/fifo/arch/ampere/kernel_fifo_ga100.c` - Ampere
+- `src/nvidia/src/kernel/gpu/fifo/arch/hopper/kernel_fifo_gh100.c` - Hopper
+
 ## 总结
 
 NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资源管理系统，具有以下特点：
@@ -652,11 +835,16 @@ NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资�
 6. **跨平台**: 抽象层支持不同操作系统
 7. **CPU-GPU 分离**: CPU-RM 管理资源对象 (存储在系统内存)，GSP-RM 控制硬件 (运行在 GPU 固件)
 8. **双内存系统**: 支持系统内存和显存的统一管理接口
+9. **用户态加速**: Volta+ 支持用户态直接提交工作，绕过内核提升性能
 
 **关键结论**: 
-- RsResource 实例存储在 **KMD (内核模式驱动)** 的系统内存中
+- **RsResource 实例**存储在 **KMD (内核模式驱动)** 的系统内存中
 - **系统内存分配**通过 OS 页分配器 (`osAllocPages`)
-- **显存分配**通过 PMA 或 Heap 从 GPU VRAM 分配
+- **显存分配**通过 PMA 或 Heap 从 GPU VRAM 分配，**核心逻辑在 KMD**
+- **CUDA 显存管理**主要在 **KMD** 中进行，GSP-RM 负责硬件控制
+- **GPFIFO 提交**:
+  - **Pre-Volta**: 用户态 → KMD → GPU (传统路径)
+  - **Volta+**: 用户态 → GPU (直接 doorbell，零系统调用)
 - GSP-RM 是独立的固件程序，通过 RPC 与 CPU-RM 通信
 
-该架构为 GPU 硬件资源的安全、高效管理提供了坚实的基础，同时支持灵活的内存分配策略以满足不同应用场景的需求。
+该架构为 GPU 硬件资源的安全、高效管理提供了坚实的基础，同时支持灵活的内存分配策略和高性能的用户态工作提交机制，以满足现代 CUDA 计算和图形应用的需求。
