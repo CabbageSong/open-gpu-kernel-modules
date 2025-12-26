@@ -426,6 +426,220 @@ serverAllocResource(...) {
 }
 ```
 
+## 内存分配流程详解
+
+### 系统内存 (SYSMEM) 分配流程
+
+系统内存分配用于需要 CPU 访问或 CPU-GPU 共享的数据。
+
+#### 1. 入口和初始化
+
+```c
+// 用户调用 NvRmAlloc 或类似 API
+sysmemConstruct_IMPL() 
+  -> memConstruct_IMPL()      // 通用内存对象构造
+```
+
+**主要代码路径**: `src/nvidia/src/kernel/mem_mgr/system_mem.c`
+
+#### 2. 资源分配核心流程
+
+```c
+sysmemConstruct_IMPL()
+  |
+  ├─> memUtilsAllocMemDesc()    // 分配内存描述符
+  |     └─> memdescCreate()     // 创建 MEMORY_DESCRIPTOR
+  |
+  ├─> sysmemAllocResources()    // 分配系统内存资源
+  |     |
+  |     ├─> memUtilsAllocMemDesc()  // 准备内存描述符
+  |     |     └─> memdescSetFlag(ADDR_SYSMEM)  // 标记为系统内存
+  |     |
+  |     ├─> memdescAlloc()      // 实际分配内存
+  |     |     └─> osAllocPages()  // OS 层分配物理页面
+  |     |           └─> osAllocPagesInternal()  // Unix/Linux 实现
+  |     |                 └─> os_alloc_pages()   // 调用内核内存分配
+  |     |
+  |     └─> 设置内存属性 (contiguity, page size, etc.)
+  |
+  └─> memConstructCommon()      // 通用构造完成
+        └─> 注册到 GPU 映射系统
+```
+
+#### 3. OS 层物理页分配
+
+**代码位置**: `src/nvidia/arch/nvalloc/unix/src/os.c`
+
+```c
+osAllocPagesInternal(MEMORY_DESCRIPTOR *pMemDesc)
+  |
+  ├─> 检查连续性要求 (contiguous/non-contiguous)
+  ├─> 确定页面大小 (4KB, 64KB, 2MB, etc.)
+  |
+  └─> os_alloc_pages()        // 内核接口
+        |
+        ├─ 连续内存: alloc_pages() 或 __get_free_pages()
+        └─ 非连续内存: vmalloc() 或逐页分配
+```
+
+#### 4. 关键特性
+
+- **页面大小**: 支持 4KB、64KB、2MB、512MB、256GB
+- **连续性**: 可以分配物理连续或非连续内存
+- **NUMA 支持**: `osAllocPagesNode()` 支持 NUMA 节点指定
+- **缓存属性**: 可配置 cached/uncached/write-combined
+- **DMA 映射**: 自动设置 IOMMU/SMMU 映射 (如果需要)
+
+### 显存 (VIDMEM) 分配流程
+
+显存分配用于 GPU 密集访问的数据，存储在 GPU 板载 VRAM 中。
+
+#### 1. 入口和初始化
+
+```c
+// 用户指定 NVOS32_ATTR_LOCATION_VIDMEM
+vidmemConstruct_IMPL()
+  -> memConstruct_IMPL()
+```
+
+**主要代码路径**: `src/nvidia/src/kernel/mem_mgr/video_mem.c`
+
+#### 2. 资源分配核心流程
+
+```c
+vidmemConstruct_IMPL()
+  |
+  ├─> memmgrAllocResources()      // 内存管理器分配
+  |
+  ├─> vidmemAllocResources()      // 显存专用分配
+  |     |
+  |     ├─> _vidmemQueryAlignment() // 查询对齐需求
+  |     |     └─> memmgrDeterminePageSize()  // 确定页面大小
+  |     |
+  |     ├─> 选择分配器:
+  |     |     |
+  |     |     ├─ PMA (Physical Memory Allocator) - 现代 GPU
+  |     |     |   └─> _vidmemPmaAllocate()
+  |     |     |         └─> pmaAllocatePages()  // PMA 分配页面
+  |     |     |               |
+  |     |     |               ├─ 检查 NUMA 配置
+  |     |     |               ├─ 设置分配选项 (连续性、对齐等)
+  |     |     |               └─ 从 GPU 帧缓冲区分配
+  |     |     |
+  |     |     └─ Heap (传统方式) - 老旧 GPU
+  |     |         └─> heapAlloc()            // 堆分配
+  |     |               └─> 从 FB heap 分配内存块
+  |     |
+  |     └─> memdescSetFlag(ADDR_FBMEM)     // 标记为帧缓冲内存
+  |
+  ├─> GSP-RM 场景:
+  |     └─> NV_RM_RPC_ALLOC_VIDMEM()       // RPC 到 GSP-RM
+  |           └─> GSP-RM 在 GPU 端执行实际硬件操作
+  |
+  └─> memConstructCommon()
+```
+
+#### 3. PMA (Physical Memory Allocator)
+
+**现代 GPU 使用 PMA 管理显存**:
+
+```c
+pmaAllocatePages(PMA *pPma, ...)
+  |
+  ├─> 检查可用内存
+  ├─> 应用分配策略
+  |     ├─ 优先连续分配 (如果请求)
+  |     ├─ NUMA 感知分配
+  |     └─ 碎片整理优化
+  |
+  ├─> 从空闲列表分配页面
+  ├─> 更新内存统计
+  └─> 返回物理帧地址
+```
+
+**代码位置**: `src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/`
+
+#### 4. Heap 分配器 (传统)
+
+**老旧 GPU 使用堆管理**:
+
+```c
+heapAlloc(Heap *pHeap, ...)
+  |
+  ├─> 在堆中查找合适的空闲块
+  ├─> 应用对齐要求
+  ├─> 分割或合并块
+  └─> 标记块为已使用
+```
+
+#### 5. 关键特性
+
+- **分配器**: PMA (现代) vs Heap (传统)
+- **页面大小**: 支持多种页面大小
+- **压缩**: 支持内存压缩 (如果硬件支持)
+- **保护内存**: 支持受保护/未受保护内存 (Confidential Computing)
+- **持久化**: 支持持久化 VIDMEM (跨重启保留)
+- **GSP-RM 集成**: 通过 RPC 与 GSP-RM 同步
+
+### 内存分配对比
+
+| 特性 | 系统内存 (SYSMEM) | 显存 (VIDMEM) |
+|------|------------------|---------------|
+| **物理位置** | 主机 RAM | GPU 板载 VRAM |
+| **分配器** | OS 页分配器 | PMA 或 Heap |
+| **主要用途** | CPU 访问、共享数据 | GPU 计算、纹理 |
+| **带宽** | PCIe 带宽限制 | 高速 GPU 内存总线 |
+| **延迟** | 较高 (PCIe) | 极低 (本地) |
+| **容量** | 取决于系统 RAM | GPU VRAM 容量 |
+| **代码路径** | `system_mem.c` | `video_mem.c` |
+| **地址空间标记** | `ADDR_SYSMEM` | `ADDR_FBMEM` |
+
+### 内存描述符 (MEMORY_DESCRIPTOR)
+
+两种分配都使用 MEMORY_DESCRIPTOR 来跟踪内存:
+
+```c
+struct MEMORY_DESCRIPTOR {
+    NvU64  Size;              // 内存大小
+    NvU64  Alignment;         // 对齐要求
+    NvU32  _flags;            // 标志 (连续性、缓存属性等)
+    NvU64  _pageSize;         // 页面大小
+    NV_ADDRESS_SPACE addressSpace;  // ADDR_SYSMEM 或 ADDR_FBMEM
+    Heap  *pHeap;             // 关联的堆 (如果使用堆分配)
+    PMA_ALLOC_INFO *pPmaAllocInfo;  // PMA 分配信息
+    // ... 更多字段
+};
+```
+
+**代码位置**: `src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c`
+
+### 分配参数和属性
+
+**NVOS32 分配参数**:
+
+```c
+NV_MEMORY_ALLOCATION_PARAMS {
+    NvU32  owner;             // 所有者 (client handle)
+    NvU32  type;              // 内存类型
+    NvU32  flags;             // 分配标志
+    NvU32  attr;              // 属性 (位置、页面大小、连续性等)
+    NvU32  attr2;             // 扩展属性
+    NvU64  size;              // 请求大小
+    NvU64  alignment;         // 对齐要求
+    NvU64  offset;            // 返回的偏移量
+    NvU64  limit;             // 返回的限制
+    // ...
+}
+```
+
+**关键属性标志**:
+
+- `NVOS32_ATTR_LOCATION_VIDMEM` - 显存分配
+- `NVOS32_ATTR_LOCATION_PCI` - 系统内存分配  
+- `NVOS32_ATTR_PHYSICALITY_CONTIGUOUS` - 物理连续
+- `NVOS32_ATTR_PHYSICALITY_NONCONTIGUOUS` - 物理非连续
+- `NVOS32_ATTR_PAGE_SIZE_*` - 页面大小选择
+
 ## 总结
 
 NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资源管理系统，具有以下特点：
@@ -437,7 +651,12 @@ NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资�
 5. **可扩展性**: 通过资源描述符和类继承支持新资源类型
 6. **跨平台**: 抽象层支持不同操作系统
 7. **CPU-GPU 分离**: CPU-RM 管理资源对象 (存储在系统内存)，GSP-RM 控制硬件 (运行在 GPU 固件)
+8. **双内存系统**: 支持系统内存和显存的统一管理接口
 
-**关键结论**: RsResource 实例存储在 **KMD (内核模式驱动)** 的系统内存中，而不是 GPU 固件内部。GSP-RM 是独立的固件程序，通过 RPC 与 CPU-RM 通信。
+**关键结论**: 
+- RsResource 实例存储在 **KMD (内核模式驱动)** 的系统内存中
+- **系统内存分配**通过 OS 页分配器 (`osAllocPages`)
+- **显存分配**通过 PMA 或 Heap 从 GPU VRAM 分配
+- GSP-RM 是独立的固件程序，通过 RPC 与 CPU-RM 通信
 
-该架构为 GPU 硬件资源的安全、高效管理提供了坚实的基础。
+该架构为 GPU 硬件资源的安全、高效管理提供了坚实的基础，同时支持灵活的内存分配策略以满足不同应用场景的需求。
