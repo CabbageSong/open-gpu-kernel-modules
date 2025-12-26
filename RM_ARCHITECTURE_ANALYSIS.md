@@ -350,6 +350,82 @@ RM 通过以下模块管理 GPU 内存：
 - `src/nvidia/src/kernel/vgpu/rpc.c` - vGPU RPC
 - `src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c` - GSP 通信
 
+## RsResource 实例存储位置
+
+### CPU-RM vs GSP-RM 架构
+
+NVIDIA GPU 驱动采用了分离式架构：
+
+1. **CPU-RM (Kernel RM / Client RM)**:
+   - 运行在主机 CPU 的内核模式驱动 (KMD)
+   - 负责操作系统交互、用户态通信
+   - 管理资源的客户端视图
+   - 所有 RsResource 实例**存储在系统内存 (host memory)** 中
+
+2. **GSP-RM (GPU System Processor RM / Physical RM)**:
+   - 运行在 GPU 内部的 GSP (GPU System Processor) 固件中
+   - 从 Turing 架构开始引入
+   - 负责 GPU 硬件直接操作、电源管理、显示控制等
+   - GSP-RM 有自己独立的资源实例，存储在 **GPU 固件内存空间**
+
+### 资源实例的内存分配
+
+查看源码可以确认：
+
+```c
+// src/nvidia/src/libraries/resserv/src/rs_server.c:324
+PORT_MEM_ALLOCATOR *pAllocator = portMemAllocatorCreateNonPaged();
+
+// src/nvidia/src/libraries/resserv/src/rs_server.c:4076
+status = objCreateDynamicWithFlags(&pDynamic, ...);
+```
+
+RsServer 使用非分页系统内存分配器创建资源对象，这意味着：
+
+- **RsResource 实例存储在 CPU 侧的系统内存 (RAM) 中**
+- 不存储在 GPU 固件内部
+- 使用内核非分页内存池，确保资源对象始终驻留在内存中
+
+### CPU-RM 和 GSP-RM 的通信
+
+两者通过 RPC (Remote Procedure Call) 机制通信：
+
+```c
+// src/nvidia/src/kernel/vgpu/rpc.c
+// 定义了 GSP-RM 相关的 RPC 调用
+NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL    // Control 调用
+NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC      // 资源分配
+```
+
+**工作流程**：
+1. CPU-RM 在系统内存中维护 RsResource 实例
+2. 当需要 GPU 硬件操作时，通过 RPC 与 GSP-RM 通信
+3. GSP-RM 在 GPU 内部维护自己的资源状态
+4. 两者保持状态同步
+
+### 为什么这样设计？
+
+1. **性能优化**: GPU 固件内存有限，不适合存储大量元数据
+2. **安全隔离**: CPU-RM 管理策略，GSP-RM 控制硬件，职责分离
+3. **向后兼容**: 老旧 GPU 无 GSP，仍可使用相同的 ResServ 架构
+4. **调试便利**: CPU 侧资源易于检查和调试
+
+### 代码证据
+
+```c
+// src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+// GSP-RM 是作为固件加载到 GPU 的
+kgspInitRm_IMPL(struct OBJGPU *pGpu, struct KernelGsp *pKernelGsp, 
+                GSP_FIRMWARE *pGspFw)
+
+// CPU-RM 中的资源分配
+// src/nvidia/src/libraries/resserv/src/rs_server.c
+serverAllocResource(...) {
+    // 在系统内存中分配资源对象
+    status = objCreateDynamicWithFlags(&pDynamic, ...);
+}
+```
+
 ## 总结
 
 NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资源管理系统，具有以下特点：
@@ -360,5 +436,8 @@ NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资�
 4. **访问控制**: 完善的权限管理系统
 5. **可扩展性**: 通过资源描述符和类继承支持新资源类型
 6. **跨平台**: 抽象层支持不同操作系统
+7. **CPU-GPU 分离**: CPU-RM 管理资源对象 (存储在系统内存)，GSP-RM 控制硬件 (运行在 GPU 固件)
+
+**关键结论**: RsResource 实例存储在 **KMD (内核模式驱动)** 的系统内存中，而不是 GPU 固件内部。GSP-RM 是独立的固件程序，通过 RPC 与 CPU-RM 通信。
 
 该架构为 GPU 硬件资源的安全、高效管理提供了坚实的基础。
