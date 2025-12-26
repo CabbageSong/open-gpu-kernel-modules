@@ -823,6 +823,457 @@ CUDA Kernel Launch:
 - `src/nvidia/src/kernel/gpu/fifo/arch/ampere/kernel_fifo_ga100.c` - Ampere
 - `src/nvidia/src/kernel/gpu/fifo/arch/hopper/kernel_fifo_gh100.c` - Hopper
 
+## CUDA 显存管理的具体算法（HBM/GDDR 上的 Buffer 管理）
+
+### 算法概述
+
+NVIDIA 开源 GPU 内核模块使用 **PMA (Physical Memory Allocator)** 作为 CUDA 显存管理的核心算法，这是一个专为 GPU VRAM (HBM/GDDR) 设计的高性能内存分配器。PMA 采用 **多层位图 (Multi-layer Bitmap)** 机制，**既不是 Buddy System 也不是 Slab**，而是一种针对 GPU 内存特性优化的自定义算法。
+
+### 核心算法：多层位图（Multi-layer Bitmap）
+
+#### 1. 位图结构 (Regmap)
+
+PMA 使用 **8 层独立位图**跟踪每个 64KB 页帧的状态和属性：
+
+```c
+// src/nvidia/inc/kernel/gpu/mem_mgr/phys_mem_allocator/regmap.h
+typedef struct pma_regmap {
+    NvU64 totalFrames;                /* 总帧数 (每帧 64KB) */
+    NvU64 mapLength;                  /* 位图长度 */
+    NvU64 *map[PMA_BITS_PER_PAGE];    /* 8 层位图数组 */
+    NvU64 frameEvictionsInProcess;    /* 正在驱逐的帧数 */
+    PMA_STATS *pPmaStats;             /* 统计信息 */
+    NvBool bProtected;                /* 是否保护内存 (VPR/CPR) */
+} PMA_REGMAP;
+```
+
+**8 层位图定义**:
+```c
+// src/nvidia/inc/kernel/gpu/mem_mgr/phys_mem_allocator/map_defines.h
+
+// 状态位图 (2 层)
+#define MAP_IDX_ALLOC_UNPIN 0  // 已分配-未锁定 (可驱逐)
+#define MAP_IDX_ALLOC_PIN   1  // 已分配-已锁定 (不可驱逐)
+
+// 属性位图 (6 层)
+#define MAP_IDX_EVICTING    2  // 正在驱逐
+#define MAP_IDX_SCRUBBING   3  // 正在清零
+#define MAP_IDX_PERSISTENT  4  // 持久化内存
+#define MAP_IDX_NUMA_REUSE  5  // NUMA 重用
+#define MAP_IDX_BLACKLIST   6  // 黑名单页面
+#define MAP_IDX_LOCALIZED   7  // 本地化内存 (uGPU)
+
+// 页面状态
+#define STATE_FREE      0x00              // 空闲
+#define STATE_UNPIN     NVBIT(0)          // 已分配-未锁定
+#define STATE_PIN       NVBIT(1)          // 已分配-已锁定
+```
+
+#### 2. 分配粒度
+
+```c
+#define PMA_GRANULARITY 0x10000  // 64KB (基础分配单位)
+#define PMA_PAGE_SHIFT  16       // 64KB = 2^16
+
+// 支持的页面大小
+#define _PMA_64KB    (64ULL  * 1024)      // 基础页
+#define _PMA_128KB   (128ULL * 1024)      // 2 个基础页
+#define _PMA_2MB     (2ULL * 1024 * 1024) // 32 个基础页 (大页优化)
+#define _PMA_512MB   (512ULL * 1024 * 1024)
+```
+
+### 分配算法详解
+
+#### 1. 连续分配算法 (`pmaRegmapScanContiguous`)
+
+**用于**: 连续大块内存 (纹理、framebuffer、大型 CUDA 数组)
+
+**核心思想**: 使用位操作快速扫描位图，寻找连续的空闲帧
+
+**算法步骤**:
+```c
+// src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/regmap.c
+
+1. 计算所需帧数:
+   numFrames = actualSize >> PMA_PAGE_SHIFT  // 例: 2MB = 32 帧
+
+2. 对齐处理:
+   frameAlignment = alignment >> PMA_PAGE_SHIFT
+   alignedAddrBase = NV_ALIGN_UP(addrBase, alignment)
+
+3. 快速位图扫描:
+   for (frameNum = frameStart; frameNum <= frameLimit - numFramesLimit; ) {
+       // 读取起始和结束帧状态
+       startFrameAllocState = pmaRegmapRead(pRegmap, frameNum);
+       endFrameAllocState = pmaRegmapRead(pRegmap, frameNum + numFramesLimit);
+       
+       // 检查是否空闲
+       if ((endFrameAllocState & STATE_MASK) != STATE_FREE) {
+           frameNum += numFrames;  // 跳过整块
+           continue;
+       }
+       
+       if ((startFrameAllocState & STATE_MASK) != STATE_FREE) {
+           frameNum += frameAlignment;  // 跳到下一个对齐位置
+           continue;
+       }
+       
+       // 使用 _checkOne() 验证中间所有帧都空闲
+       if (_checkOne(bits, start, end) == -1) {
+           // 找到连续空闲块!
+           *freeList = frameNum;
+           return NV_OK;
+       }
+   }
+```
+
+**优化技术**:
+
+**A. 位操作加速** (`_checkOne`):
+```c
+// 快速验证连续空闲块
+static NvS64 _checkOne(NvU64 *bits, NvU64 start, NvU64 end) {
+    startMapIdx = PAGE_MAPIDX(start);   // start / 64
+    startBitIdx = PAGE_BITIDX(start);   // start % 64
+    
+    // 检查中间的 64 位字
+    for (mapIdx = startMapIdx + 1; mapIdx <= (endMapIdx - 1); mapIdx++) {
+        if (bits[mapIdx] != 0) {
+            // 使用 portUtilCountTrailingZeros64() 找到第一个非零位
+            firstSetBit = portUtilCountTrailingZeros64(bits[mapIdx]);
+            return (mapIdx << 6) + firstSetBit;  // 返回第一个已分配帧
+        }
+    }
+    return -1;  // 全部空闲
+}
+```
+
+**B. 最长零序列查找** (`maxZerosGet`):
+```c
+// 找到 64 位中最长的连续零序列
+static NvU32 maxZerosGet(NvU64 bits, NvU32* pStartPos) {
+    if (bits == 0) {
+        return 64;  // 全零
+    }
+    
+    // 1. 计算前导零
+    leadingZeros = portUtilCountLeadingZeros64(bits);
+    
+    // 2. 扫描内部零序列
+    while (currentPos < 64) {
+        // 跳过 1
+        ones = portUtilCountTrailingZeros64(~remainingBits);
+        currentPos += ones;
+        remainingBits >>= ones;
+        
+        // 计数 0
+        zeros = portUtilCountTrailingZeros64(remainingBits);
+        if (zeros > maxZeros) {
+            maxZeros = zeros;
+            bestStartPos = currentPos;
+        }
+        currentPos += zeros;
+        remainingBits >>= zeros;
+    }
+    
+    return maxZeros;
+}
+```
+
+#### 2. 非连续分配算法 (`pmaRegmapScanDiscontiguous`)
+
+**用于**: 小块内存、碎片化场景
+
+**核心思想**: 尽可能分配连续块，但允许碎片
+
+**算法步骤**:
+```c
+1. 初始化搜索状态:
+   NvU64 latestFree[PMA_BITS_PER_PAGE];  // 8 层位图的最新空闲位置
+   
+2. 遍历所有帧:
+   for (frameNum = 0; frameNum < totalFrames && pagesAllocated < numPages; ) {
+       // 计算当前位图索引
+       mapIdx = frameNum >> 6;  // frameNum / 64
+       bitIdx = frameNum & 0x3F;  // frameNum % 64
+       
+       // 检查所有 8 层位图
+       NvU64 combined = 0;
+       for (i = 0; i < PMA_BITS_PER_PAGE; i++) {
+           combined |= pRegmap->map[i][mapIdx];
+       }
+       
+       // 找到空闲位
+       if (!(combined & (1ULL << bitIdx))) {
+           freeList[pagesAllocated++] = frameNum;
+       }
+       
+       frameNum++;
+   }
+```
+
+#### 3. 2MB 大页优化
+
+**触发条件**: 
+- 分配大小 >= 2MB
+- 对齐要求 >= 2MB
+- `PMA_ALLOCATE_CONTIGUOUS` 标志
+
+**优化效果**:
+```c
+// 统计信息
+PMA_STATS {
+    NvU64 num2mbPages;           // 总 2MB 页数
+    NvU64 numFree2mbPages;       // 空闲 2MB 页数
+    
+    // 快速查找空闲 2MB 块
+    num2mbPages = totalFrames / (_PMA_2MB >> PMA_PAGE_SHIFT);
+    // = totalFrames / 32
+}
+```
+
+**分配策略**:
+1. 优先从 2MB 对齐的空闲块分配
+2. 更新 `num2mbPages` 统计
+3. 减少页表条目 (32 个 64KB → 1 个 2MB)
+4. 提高 TLB 命中率
+
+### 驱逐算法 (Eviction)
+
+#### NUMA 驱逐 (`pmaRegMapScanContiguousNumaEviction`)
+
+**场景**: ATS/HMM 系统中内存不足时
+
+**算法**:
+```c
+1. 扫描可驱逐范围:
+   // 只有 ALLOC_UNPIN 状态可驱逐
+   for (frameNum = frameStart; frameNum <= frameLimit; ) {
+       // 检查起始和结束帧
+       if ((endFrameAllocState & STATE_MASK) != STATE_UNPIN) {
+           frameNum += numFrames;  // 跳过
+           continue;
+       }
+       
+       // 使用 _pmaRegmapScanNumaUnevictable() 验证整块可驱逐
+       firstUnevictableFrame = _pmaRegmapScanNumaUnevictable(
+           pRegmap, frameNum, frameNum + numFramesLimit);
+       
+       if (firstUnevictableFrame == -1) {
+           // 找到可驱逐块
+           *evictStart = addrBase + (frameNum << PMA_PAGE_SHIFT);
+           *evictEnd = *evictStart + actualSize - 1;
+           return NV_OK;
+       }
+       
+       // 跳到不可驱逐帧之后
+       frameNum = alignUpToMod(firstUnevictableFrame + 1, 
+                               frameAlignment, frameAlignmentPadding);
+   }
+```
+
+**驱逐状态转换**:
+```
+STATE_UNPIN → ATTRIB_EVICTING (设置驱逐位)
+            → 回调 UVM 驱逐 (pmaEvictPagesCb_t)
+            → STATE_FREE (驱逐完成)
+```
+
+### 内存清零 (Scrubbing)
+
+**安全要求**: 防止数据泄漏
+
+**算法**:
+```c
+// src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.c
+
+if (pPma->bScrubOnFree) {
+    // 设置 scrubbing 位
+    pmaRegmapChangePageStateAttrib(pMap, frameNum, pageSize, 
+                                   ATTRIB_SCRUBBING, ATTRIB_SCRUBBING);
+    
+    // 异步清零 (通过 SEC2 引擎或 CE)
+    status = pPma->pScrubObj->scrubSubmitPages(
+        pPma->pScrubObj, numPages, pPages, pageSize);
+    
+    // 清零完成后清除 scrubbing 位
+}
+```
+
+### 黑名单管理 (Blacklisting)
+
+**用途**: ECC 错误页面管理
+
+**数据结构**:
+```c
+typedef struct {
+    NvU64  physOffset;  // 物理偏移 (64KB 对齐)
+    NvBool bIsDynamic;  // 动态黑名单
+    NvBool bIsValid;    // 是否仍由 RM 管理
+} PMA_BLACKLIST_CHUNK;
+```
+
+**算法**:
+```c
+1. 标记黑名单页:
+   pmaRegmapChangePageStateAttrib(pMap, frameNum, pageSize,
+                                  ATTRIB_BLACKLIST, ATTRIB_BLACKLIST);
+
+2. 分配时跳过:
+   if (frameState & ATTRIB_BLACKLIST) {
+       frameNum++;  // 跳过黑名单帧
+       continue;
+   }
+```
+
+### 性能特性对比
+
+| 特性 | PMA Multi-Bitmap | Buddy System | Slab Allocator |
+|------|------------------|--------------|----------------|
+| **分配粒度** | 64KB (固定) | 可变 (2^n) | 固定小对象 |
+| **连续分配** | O(n/64) 位扫描 | O(log n) 分裂 | 不支持 |
+| **碎片化处理** | 位图紧凑 | 需要合并 | 内部碎片高 |
+| **大块优化** | 2MB 大页 | 高阶块 | 不适用 |
+| **驱逐支持** | 原生支持 | 需额外逻辑 | 不支持 |
+| **NUMA 感知** | 集成 | 需扩展 | 需扩展 |
+| **并发性能** | 分层锁 | 全局锁 | 每 CPU 缓存 |
+| **内存开销** | 8 bits/64KB<br>= 0.00012% | 指针开销 | 元数据开销高 |
+
+### 算法复杂度分析
+
+**连续分配**:
+- **最优情况**: O(1) - 第一个位置就找到
+- **平均情况**: O(n/64) - 位图扫描，每次检查 64 帧
+- **最坏情况**: O(n) - 扫描整个内存空间
+
+**非连续分配**:
+- **时间复杂度**: O(n) - 线性扫描
+- **空间复杂度**: O(1) - 原地操作
+
+**位图查找优化**:
+```c
+// 使用硬件加速的位操作
+portUtilCountTrailingZeros64(bits)  // CLZ 指令 - O(1)
+portUtilCountLeadingZeros64(bits)   // CTZ 指令 - O(1)
+```
+
+### PMA vs Buddy System vs Slab 的选择理由
+
+**为什么 NVIDIA 选择 PMA 而非 Buddy System?**
+
+1. **固定粒度优势**:
+   - GPU 内存访问以 64KB 页为单位（硬件特性）
+   - 避免 Buddy System 的分裂/合并开销
+   - 位图操作比树操作更快
+
+2. **碎片化控制**:
+   - Buddy System 的外部碎片问题严重
+   - PMA 的位图紧凑表示，碎片可见性高
+   - 支持主动碎片整理（驱逐机制）
+
+3. **驱逐集成**:
+   - GPU 内存常需驱逐到系统内存
+   - PMA 原生支持 UNPIN/PIN 状态
+   - Buddy System 需额外元数据跟踪
+
+4. **NUMA/HMM 支持**:
+   - PMA 设计时就考虑 ATS/HMM
+   - 与 OS 内存管理器无缝集成
+   - Buddy System 是自包含的，难以集成
+
+**为什么不用 Slab?**
+
+1. **分配大小**:
+   - Slab 适合小对象（< 4KB）
+   - CUDA 显存常是 MB/GB 级别
+   - Slab 的内部碎片不可接受
+
+2. **不需要对象池**:
+   - Slab 的优势是对象重用
+   - GPU 内存是匿名页面，无对象语义
+   - 不需要构造/析构函数
+
+### 实际应用示例
+
+#### CUDA 内存分配路径
+
+```
+用户态:
+cudaMalloc(&ptr, 128 * 1024 * 1024)  // 128MB
+
+↓ ioctl
+
+KMD:
+vidmemConstruct_IMPL()
+  ↓
+vidmemAllocResources()
+  ↓
+pmaAllocatePages(pPma, 
+                 pageCount = 128MB / 64KB = 2048,
+                 pageSize = 64KB,
+                 flags = PMA_ALLOCATE_CONTIGUOUS)
+  ↓
+PMA 位图扫描:
+  - 扫描 2048 个连续空闲帧
+  - 使用 _checkOne() 快速验证
+  - 找到位置: 帧 #5000 ~ #7047
+  ↓
+标记位图:
+  - map[MAP_IDX_ALLOC_PIN][78] |= 0xFFFFFFFFF8000000
+  - map[MAP_IDX_ALLOC_PIN][79-109] = 0xFFFFFFFFFFFFFFFF
+  - map[MAP_IDX_ALLOC_PIN][110] |= 0x000000000000007F
+  ↓
+更新统计:
+  - pPmaStats->numFreeFrames -= 2048
+  - pPmaStats->numFree2mbPages -= 64
+  ↓
+返回物理地址:
+  fbOffset = 5000 * 64KB = 320MB
+```
+
+### 调试和监控
+
+**PMA 统计信息**:
+```c
+typedef struct _PMA_STATS {
+    NvU64 num2mbPages;               // 总 2MB 页数
+    NvU64 numFreeFrames;             // 空闲 64KB 帧数
+    NvU64 numFree2mbPages;           // 空闲 2MB 页数
+    NvU64 numFreeFramesProtected;    // 保护内存空闲帧
+    NvU64 numFreeFramesLocalizable[2]; // 每 uGPU 空闲帧
+} PMA_STATS;
+```
+
+**位图可视化**:
+```c
+// 调试输出
+void pmaRegmapPrint(PMA_REGMAP *pMap) {
+    for (j = 0; j < PMA_BITS_PER_PAGE; j++) {
+        NV_PRINTF("*** %d-th MAP ***\n", j);
+        for (i = 0; i < pMap->mapLength; i+=4) {
+            NV_PRINTF("map[%d]: %llx\n", i, pMap->map[j][i]);
+        }
+    }
+}
+```
+
+### 总结
+
+NVIDIA 的 PMA (Physical Memory Allocator) 是一个**自定义的多层位图分配器**，专为 GPU VRAM 的特性优化：
+
+**核心特点**:
+1. **8 层位图**: 2 层状态 + 6 层属性，精确跟踪每个 64KB 帧
+2. **位操作优化**: 使用硬件 CLZ/CTZ 指令加速扫描
+3. **固定粒度**: 64KB 基础单位，2MB 大页优化
+4. **驱逐集成**: 原生支持 UNPIN/PIN 和 NUMA 驱逐
+5. **低开销**: 位图仅占 0.00012% 内存
+
+**优于传统算法**:
+- **vs Buddy System**: 避免分裂/合并，碎片可见，驱逐友好
+- **vs Slab**: 支持大块分配，无内部碎片，适合 GPU 场景
+
+PMA 是针对 **HBM/GDDR 高带宽内存**和 **CUDA 计算负载**专门设计的高性能内存管理算法。
+
 ## Ada Lovelace 架构显存分配策略详解
 
 ### Ada 架构概述
