@@ -823,6 +823,258 @@ CUDA Kernel Launch:
 - `src/nvidia/src/kernel/gpu/fifo/arch/ampere/kernel_fifo_ga100.c` - Ampere
 - `src/nvidia/src/kernel/gpu/fifo/arch/hopper/kernel_fifo_gh100.c` - Hopper
 
+## Ada Lovelace 架构显存分配策略详解
+
+### Ada 架构概述
+
+Ada Lovelace (AD10X) 是 NVIDIA 的最新数据中心 GPU 架构（本代码库 v590.48.01），继承了 Ampere/Hopper 的先进内存管理特性，同时引入了架构特定的优化策略。
+
+### Ada 架构显存分配核心策略
+
+#### 1. PMA (Physical Memory Allocator) 主导
+
+Ada 架构**完全使用 PMA** 作为显存分配器，已废弃传统 Heap 分配器。
+
+**核心特点**:
+```c
+// src/nvidia/src/kernel/gpu/mem_mgr/arch/ada/mem_mgr_ad102.c
+// src/nvidia/src/kernel/gpu/mem_mgr/arch/ada/mem_mgr_ad104.c
+
+// Ada 继承 Ampere/Hopper PMA 机制
+- 64KB 页面粒度 (PMA_GRANULARITY = 64KB)
+- 支持 2MB 大页优化
+- NUMA 感知分配 (ATS/HMM 场景)
+- 动态碎片整理
+- 零拷贝 eviction 支持
+```
+
+#### 2. 上下文保留内存策略
+
+**AD102** (高端 SKU - RTX 6000 Ada):
+```c
+// mem_mgr_ad102.c:34
+NvU64 memmgrGetMaxContextSize_AD102(OBJGPU *pGpu, MemoryManager *pMemoryManager)
+{
+    NvU64 size = memmgrGetMaxContextSize_GA100(pGpu, pMemoryManager);
+    
+    if (RMCFG_FEATURE_PLATFORM_MODS) {
+        size += 64 * 1024 * 1024;  // +64MB for MODS 测试平台
+    }
+    return size;
+}
+```
+
+**AD104** (中端 SKU - RTX 4000 Ada):
+```c
+// mem_mgr_ad104.c:35
+NvU64 memmgrGetMaxContextSize_AD104(OBJGPU *pGpu, MemoryManager *pMemoryManager)
+{
+    NvU64 fbSize = 0;
+    NvU64 size = memmgrGetMaxContextSize_GA100(pGpu, pMemoryManager);
+    
+    // 获取可用 FB 大小
+    kmemsysGetUsableFbSize_HAL(pGpu, pKernelMemorySystem, &fbSize);
+    const NvU32 fbSizeGB = (NvU32)(NV_ALIGN_UP64(fbSize, 1 << 30) >> 30);
+    
+    // 小显存 GPU 优化 (< 12GB)
+    if (fbSizeGB < 12) {
+        size += 10 * 1024 * 1024;  // +10MB 缓冲 (Bug: 4455873)
+    }
+    
+    if (RMCFG_FEATURE_PLATFORM_MODS) {
+        size += 64 * 1024 * 1024;
+    }
+    return size;
+}
+```
+
+**策略说明**:
+- **高端 GPU (AD102)**: 统一保留策略，不考虑显存大小
+- **中端 GPU (AD104)**: 根据 FB 大小动态调整保留内存
+  - < 12GB: 额外 +10MB 保护缓冲
+  - ≥ 12GB: 标准保留
+- **MODS 平台**: 所有 SKU 额外 +64MB 用于测试和调试
+
+#### 3. 内存分配流程 (Ada 架构)
+
+**CUDA 显存分配完整路径**:
+
+```
+用户态 CUDA Runtime:
+  cuMemAlloc(size) / cudaMalloc(size)
+    ↓
+  ioctl(NV_ESC_RM_ALLOC_MEMORY)
+    ↓
+  
+KMD (内核模式驱动):
+  RmAllocMemory()
+    ↓
+  RMAPI: rmapiAlloc()
+    ↓
+  vidmemConstruct_IMPL()
+    ↓
+  vidmemAllocResources()
+    ↓
+  memdescAlloc()
+    ↓
+  
+PMA 分配器 (Ada 使用):
+  pmaAllocatePages(pPma, pageCount, pageSize, allocFlags)
+    ↓
+  // Ada 特定优化
+  - 64KB 对齐检查
+  - NUMA 节点选择 (如果启用)
+  - 压缩支持检查 (Ada 支持 GMK 压缩)
+  - 内存区域选择 (考虑 ECC/Protected 属性)
+    ↓
+  
+物理页面分配:
+  - 更新 PMA 位图 (regmap)
+  - 标记页面状态: FREE → ALLOC_PIN
+  - 记录分配元数据
+    ↓
+  
+GSP-RM 同步 (如果启用):
+  NV_RM_RPC_ALLOC_VIDMEM(pGpu, ...)
+    ↓
+  GSP 固件更新硬件页表和状态
+    ↓
+  
+返回给用户态:
+  - 物理地址 (FB 偏移)
+  - 虚拟地址 (如果已映射)
+  - 内存描述符
+```
+
+#### 4. Ada 架构特定优化
+
+**4.1 压缩支持**
+
+Ada 支持 **GMK (Generic Memory Kind) 压缩**:
+```c
+// src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c
+// Ada 继承 Turing+ 压缩机制
+
+- 支持 4KB/64KB 压缩页面
+- compressionPageSize: 动态选择
+- 压缩率: 2:1 到 8:1 (取决于数据)
+- 适用场景: 纹理、framebuffer、CUDA 大数组
+```
+
+**4.2 NUMA 感知分配**
+
+在 ATS/HMM 启用的系统中:
+```c
+// src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/numa.c
+
+Ada NUMA 策略:
+- numaNodeId: GPU 对应的 NUMA 节点
+- 优先从本地节点分配
+- numaReclaimSkipThreshold: 回收阈值 (默认 90%)
+- 支持自动 online (PMA_INIT_NUMA_AUTO_ONLINE)
+```
+
+**4.3 ECC 内存管理**
+
+Ada 支持 ECC 保护内存:
+```c
+分配标志:
+- NVOS32_ALLOC_FLAGS_PROTECTED_MEM: ECC 保护
+- 自动 scrubbing (初始化清零)
+- 错误检测和纠正 (SECDED)
+```
+
+#### 5. Ada 显存分配参数和标志
+
+**常用分配标志** (`NVOS32_ALLOC_FLAGS_*`):
+```c
+- ALIGNMENT_FORCE: 强制对齐 (64KB/2MB)
+- PERSISTENT_VIDMEM: 持久化内存 (跨进程)
+- FIXED_ADDRESS_ALLOCATE: 固定地址分配
+- SKIP_SCRUB: 跳过内存清零 (性能优化)
+- PROTECTED_MEM: ECC 保护内存
+- TURBO_CIPHER_ENCRYPTED: 加密内存 (安全计算)
+- NUMA: NUMA 感知分配
+```
+
+**PMA 分配选项** (`PMA_ALLOCATION_OPTIONS`):
+```c
+struct PMA_ALLOCATION_OPTIONS {
+    NvU32 flags;              // PMA_ALLOCATE_CONTIGUOUS 等
+    NvU32 numaCpuNodeId;      // NUMA CPU 节点
+    NvU64 alignment;          // 对齐要求
+    NvU32 resultContiguity;   // 连续性要求
+};
+```
+
+#### 6. Ada 架构性能优化建议
+
+**6.1 大块分配优化**
+```c
+// 推荐: 使用 2MB 大页
+cudaMalloc(&ptr, 2 * 1024 * 1024);  // 2MB 对齐
+
+优势:
+- 减少页表条目
+- 提高 TLB 命中率
+- PMA 分配效率更高
+```
+
+**6.2 批量分配**
+```c
+// 推荐: 批量分配而非多次小分配
+cudaMalloc(&ptr, total_size);  // 一次大块
+
+而非:
+for (i = 0; i < N; i++)
+    cudaMalloc(&ptrs[i], small_size);  // 多次小块 (碎片化)
+```
+
+**6.3 持久化内存复用**
+```c
+// 对于长生命周期数据，使用持久化分配
+NV_MEMORY_ALLOCATION_PARAMS params = {0};
+params.flags = NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
+
+优势:
+- 跨进程共享
+- 避免频繁分配/释放
+```
+
+#### 7. Ada vs Ampere vs Hopper 对比
+
+| 特性 | Ampere (GA10X) | Ada (AD10X) | Hopper (GH10X) |
+|------|----------------|-------------|----------------|
+| **PMA 粒度** | 64KB | 64KB | 64KB |
+| **大页支持** | 2MB | 2MB | 2MB |
+| **压缩** | 是 (GMK) | 是 (GMK) | 是 (GMK+) |
+| **ECC** | 可选 | 可选 | 标准 (数据中心) |
+| **NUMA** | 支持 | 支持 | 增强 |
+| **最大 FB** | 48GB | 48GB | 80GB+ |
+| **GSP-RM** | 支持 | 支持 | 必需 |
+| **Scrubbing** | 软件 | 软件 | 硬件加速 |
+| **上下文保留** | 基础 | 分层 (AD102/AD104) | 统一 |
+
+#### 8. Ada 架构调试和监控
+
+**PMA 统计信息**:
+```c
+// 查询 PMA 状态
+NV_STATUS pmaQueryConfigs(PMA *pPma, NvU32 *pConfig);
+
+统计项:
+- pmaStats.numFreeFrames: 空闲帧数
+- pmaStats.num2mbPages: 2MB 页数
+- pmaStats.numAllocations: 分配次数
+- evictionInProgress: 是否正在 eviction
+```
+
+**调试寄存器键**:
+```
+NV_REG_STR_RM_ENABLE_PMA=1              # 启用 PMA
+NV_REG_STR_RM_ENABLE_PMA_MANAGED_PTABLES # PMA 管理页表
+```
+
 ## 总结
 
 NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资源管理系统，具有以下特点：
@@ -836,6 +1088,7 @@ NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资�
 7. **CPU-GPU 分离**: CPU-RM 管理资源对象 (存储在系统内存)，GSP-RM 控制硬件 (运行在 GPU 固件)
 8. **双内存系统**: 支持系统内存和显存的统一管理接口
 9. **用户态加速**: Volta+ 支持用户态直接提交工作，绕过内核提升性能
+10. **Ada 优化**: 分层内存策略、GMK 压缩、NUMA 感知、ECC 支持
 
 **关键结论**: 
 - **RsResource 实例**存储在 **KMD (内核模式驱动)** 的系统内存中
@@ -845,6 +1098,13 @@ NVIDIA 开源 GPU 内核模块的 Resource Manager 是一个设计精良的资�
 - **GPFIFO 提交**:
   - **Pre-Volta**: 用户态 → KMD → GPU (传统路径)
   - **Volta+**: 用户态 → GPU (直接 doorbell，零系统调用)
+- **Ada 显存分配**:
+  - **AD102**: 统一保留策略 (+64MB MODS)
+  - **AD104**: 动态保留 (< 12GB +10MB)
+  - **PMA 主导**: 64KB 粒度，2MB 大页，GMK 压缩
+  - **NUMA 感知**: 本地节点优先，自动 online
+  - **ECC 保护**: 可选 SECDED，自动 scrubbing
 - GSP-RM 是独立的固件程序，通过 RPC 与 CPU-RM 通信
 
-该架构为 GPU 硬件资源的安全、高效管理提供了坚实的基础，同时支持灵活的内存分配策略和高性能的用户态工作提交机制，以满足现代 CUDA 计算和图形应用的需求。
+**Ada 架构特色**:
+Ada Lovelace 通过分层内存保留策略、增强的 PMA 分配器、GMK 压缩支持、NUMA 感知和 ECC 保护，为现代 CUDA 计算和 AI/ML 工作负载提供了高效、可靠的显存管理机制。其设计充分考虑了不同 SKU 的硬件特性，通过动态策略优化内存利用率和性能。
