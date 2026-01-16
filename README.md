@@ -169,14 +169,14 @@ for the target kernel.
 
 RM exposes NVOC classes as user-visible handles. The class list generated in [`src/nvidia/generated/g_allclasses.h`](src/nvidia/generated/g_allclasses.h) shows the kinds of resources RM manages:
 
-- Root/client sessions and device hierarchy: `NV01_ROOT`/`NV01_ROOT_CLIENT` (lines 36-38) and GPU/device/subdevice/BINAPI classes `NV0020_GPU_MANAGEMENT`, `NV01_DEVICE_0`, `NV20_SUBDEVICE_0`, `NV2081_BINAPI`, `NV2082_BINAPI_PRIVILEGED` (lines 40-44).
+- Root/client sessions and device hierarchy: `NV01_ROOT` (line 36), `NV01_ROOT_NON_PRIV` (line 37), `NV01_ROOT_CLIENT` (line 38), and GPU/device/subdevice/BINAPI classes `NV0020_GPU_MANAGEMENT`, `NV01_DEVICE_0`, `NV20_SUBDEVICE_0`, `NV2081_BINAPI`, `NV2082_BINAPI_PRIVILEGED` (lines 40-44).
 - Memory and mapping objects: system/local/user/physical/virtual memory classes (e.g., `NV01_MEMORY_SYSTEM`, `NV01_MEMORY_LOCAL_USER`, `NV01_MEMORY_VIRTUAL`), sync points and export/import memory (`NV01_MEMORY_SYNCPOINT`, `NV_MEMORY_EXPORT`, `NV_MEMORY_FABRIC`, `NV_MEMORY_MULTICAST_FABRIC`), and the memory mapper `NV_MEMORY_MAPPER` (lines 47-69).
 - Address spaces and context descriptors: GPU/Fabric/IO virtual address spaces (`NV01_CONTEXT_DMA` line 46, `FABRIC_VASPACE_A` line 68, `IO_VASPACE_A` line 70, `FERMI_VASPACE_A` line 167) for describing access contexts.
 - Channel and engine execution resources: per-generation GPFIFO channels (lines 81-93), user-mode/display interfaces (lines 94-152), and copy/compute/graphics engine contexts such as `DMA_COPY` and `*_COMPUTE_*` (lines 200-234) used to schedule graphics, compute, and DMA work.
 - Display, video, and multimedia units: display heads, window/cursor channels, VBlank callbacks, and video decode/encode/NVJPG/OFA engine classes (lines 101-199).
 - Synchronization and event/time objects: events, timers, semaphores, and event buffers (e.g., `NV01_EVENT` line 72, `NV01_TIMER` line 76, `GF100_TIMED_SEMAPHORE_SW` line 161, `NV_EVENT_BUFFER` line 245, `NV_SEMAPHORE_SURFACE` line 249).
-- Debug, performance, and telemetry: profilers, debug buffers, access-counter and MMU fault buffers (`GF100_PROFILER`, `MAXWELL_PROFILER`, `NV40_DEBUG_BUFFER`, `ACCESS_COUNTER_NOTIFY_BUFFER`, `MMU_FAULT_BUFFER`, lines 150-214).
-- Virtualization and security: VGPU device/config classes, confidential compute, and SMC partition monitoring (`KEPLER_DEVICE_VGPU`, `NVA081_VGPU_CONFIG`, `NV_CONFIDENTIAL_COMPUTE`, `AMPERE_SMC_*`, lines 223-228, 238-247).
+- Debug, performance, and telemetry: profilers and perf buffers (`GF100_PROFILER`, `MAXWELL_PROFILER`, `MAXWELL_PROFILER_CONTEXT/DEVICE` lines 153-156, `G84_PERFBUFFER` line 162), access-counter and MMU fault buffers (lines 211-214), debug data (`NV40_DEBUG_BUFFER`, `RM_USER_SHARED_DATA`, `GT200_DEBUGGER` lines 235-237), and counter collection (`NV_COUNTER_COLLECTION_UNIT` line 248).
+- Virtualization and security: SMC partition/config/monitor classes (`AMPERE_SMC_*` lines 223-227), VGPU device/config classes (`KEPLER_DEVICE_VGPU`, `NVA081_VGPU_CONFIG`, `NVA084_KERNEL_HOST_VGPU_DEVICE` lines 239-241), and confidential compute (`NV_CONFIDENTIAL_COMPUTE` line 247).
 
 These handle classes cover GPU hierarchy, memory/address space, scheduling/engine execution, display and multimedia, synchronization, debugging/performance, and virtualization/security resources, illustrating RM’s role in abstracting and managing GPU resources.
 
