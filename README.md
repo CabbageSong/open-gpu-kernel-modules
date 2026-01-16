@@ -165,20 +165,20 @@ for the target kernel.
 - `nouveau/`                    Tools for integration with the Nouveau device driver
 
 
-## Resource Manager (RM) 管理的资源类型概览
+## Resource Manager (RM) managed resource types overview
 
-RM 通过 NVOC 类为用户态提供统一的句柄对象，具体类列表由芯片配置生成在 [`src/nvidia/generated/g_allclasses.h`](src/nvidia/generated/g_allclasses.h)。从这些类可以看出 RM 负责管理的核心资源类型包括：
+RM exposes NVOC classes as user-visible handles. The class list generated in [`src/nvidia/generated/g_allclasses.h`](src/nvidia/generated/g_allclasses.h) shows the kinds of resources RM manages:
 
-- 根/客户端会话与设备层级：`NV01_ROOT`、`NV01_ROOT_CLIENT`、`NV0020_GPU_MANAGEMENT`、`NV01_DEVICE_0`、`NV20_SUBDEVICE_0` 及 `NV2081_BINAPI`/`NV2082_BINAPI_PRIVILEGED`（见 g_allclasses.h 第 36-46 行）。
-- 内存与映射对象：系统/本地/用户/物理/虚拟内存类（如 `NV01_MEMORY_SYSTEM`、`NV01_MEMORY_LOCAL_USER`、`NV01_MEMORY_VIRTUAL`）、同步点与导出/导入内存（如 `NV01_MEMORY_SYNCPOINT`、`NV_MEMORY_EXPORT`、`NV_MEMORY_FABRIC`、`NV_MEMORY_MULTICAST_FABRIC`）以及内存映射器 `NV_MEMORY_MAPPER`（同文件第 47-70 行）。
-- 地址空间与上下文：GPU/Fabric/IO 虚拟地址空间类（`FERMI_VASPACE_A`、`FABRIC_VASPACE_A`、`IO_VASPACE_A`，第 68、167 行），上下文 DMA (`NV01_CONTEXT_DMA`) 等用于描述访问上下文。
-- 通道与执行引擎资源：各代 GPFIFO 渠道、用户态接口和复制/计算/图形引擎上下文（如 `KEPLER_CHANNEL_GPFIFO_A`、`HOPPER_CHANNEL_GPFIFO_A`、`DMA_COPY`、`*_COMPUTE_*`，第 81-233 行），用于调度图形、计算和 DMA 工作。
-- 显示、视频与多媒体单元：显示面 (Display) 相关类、窗口/光标通道、VBlank 回调，以及视频解码/编码/NVJPG/OFA 等引擎类（第 101-199 行）。
-- 同步与事件/时间类：事件、计时器、信号量和事件缓冲对象（如 `NV01_EVENT`、`NV01_TIMER`、`NV_SEMAPHORE_SURFACE`、`NV_EVENT_BUFFER`、`GF100_TIMED_SEMAPHORE_SW`，第 73、161、245、249 行）。
-- 调试、性能与管理功能：性能分析器、调试缓冲、访问计数与 MMU 故障缓冲等（如 `GF100_PROFILER`、`MAXWELL_PROFILER`、`NV40_DEBUG_BUFFER`、`ACCESS_COUNTER_NOTIFY_BUFFER`、`MMU_FAULT_BUFFER`，第 150-214 行）。
-- 虚拟化与安全相关：VGPU 设备/配置、保密计算、SMC 分区监控等（如 `KEPLER_DEVICE_VGPU`、`NVA081_VGPU_CONFIG`、`NV_CONFIDENTIAL_COMPUTE`、`AMPERE_SMC_*`，第 238-247、223-228 行）。
+- Root/client sessions and device hierarchy: `NV01_ROOT`, `NV01_ROOT_CLIENT`, `NV0020_GPU_MANAGEMENT`, `NV01_DEVICE_0`, `NV20_SUBDEVICE_0`, and `NV2081_BINAPI`/`NV2082_BINAPI_PRIVILEGED` (see g_allclasses.h lines 36-46).
+- Memory and mapping objects: system/local/user/physical/virtual memory classes (e.g., `NV01_MEMORY_SYSTEM`, `NV01_MEMORY_LOCAL_USER`, `NV01_MEMORY_VIRTUAL`), sync points and export/import memory (`NV01_MEMORY_SYNCPOINT`, `NV_MEMORY_EXPORT`, `NV_MEMORY_FABRIC`, `NV_MEMORY_MULTICAST_FABRIC`), and the memory mapper `NV_MEMORY_MAPPER` (lines 47-70).
+- Address spaces and context descriptors: GPU/Fabric/IO virtual address spaces (`FERMI_VASPACE_A`, `FABRIC_VASPACE_A`, `IO_VASPACE_A`, lines 68, 167) plus context DMA (`NV01_CONTEXT_DMA`) for describing access contexts.
+- Channel and engine execution resources: per-generation GPFIFO channels, user-mode interfaces, and copy/compute/graphics engine contexts (e.g., `KEPLER_CHANNEL_GPFIFO_A`, `HOPPER_CHANNEL_GPFIFO_A`, `DMA_COPY`, `*_COMPUTE_*`, lines 81-233) used to schedule graphics, compute, and DMA work.
+- Display, video, and multimedia units: display heads, window/cursor channels, VBlank callbacks, and video decode/encode/NVJPG/OFA engine classes (lines 101-199).
+- Synchronization and event/time objects: events, timers, semaphores, and event buffers (e.g., `NV01_EVENT`, `NV01_TIMER`, `NV_SEMAPHORE_SURFACE`, `NV_EVENT_BUFFER`, `GF100_TIMED_SEMAPHORE_SW`, lines 73, 161, 245, 249).
+- Debug, performance, and telemetry: profilers, debug buffers, access-counter and MMU fault buffers (`GF100_PROFILER`, `MAXWELL_PROFILER`, `NV40_DEBUG_BUFFER`, `ACCESS_COUNTER_NOTIFY_BUFFER`, `MMU_FAULT_BUFFER`, lines 150-214).
+- Virtualization and security: VGPU device/config classes, confidential compute, and SMC partition monitoring (`KEPLER_DEVICE_VGPU`, `NVA081_VGPU_CONFIG`, `NV_CONFIDENTIAL_COMPUTE`, `AMPERE_SMC_*`, lines 223-228, 238-247).
 
-这些句柄类覆盖了 GPU 层级、内存与地址空间、调度/执行引擎、显示多媒体、同步、调试性能及虚拟化/安全等主要资源，体现了 RM 在驱动中的资源抽象与生命周期管理角色。
+These handle classes cover GPU hierarchy, memory/address space, scheduling/engine execution, display and multimedia, synchronization, debugging/performance, and virtualization/security resources, illustrating RM’s role in abstracting and managing GPU resources.
 
 
 ## Nouveau device driver integration
