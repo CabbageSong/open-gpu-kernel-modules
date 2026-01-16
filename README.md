@@ -169,12 +169,12 @@ for the target kernel.
 
 RM exposes NVOC classes as user-visible handles. The class list generated in [`src/nvidia/generated/g_allclasses.h`](src/nvidia/generated/g_allclasses.h) shows the kinds of resources RM manages:
 
-- Root/client sessions and device hierarchy: `NV01_ROOT`, `NV01_ROOT_CLIENT`, `NV0020_GPU_MANAGEMENT`, `NV01_DEVICE_0`, `NV20_SUBDEVICE_0`, and `NV2081_BINAPI`/`NV2082_BINAPI_PRIVILEGED` (see g_allclasses.h lines 36-46).
-- Memory and mapping objects: system/local/user/physical/virtual memory classes (e.g., `NV01_MEMORY_SYSTEM`, `NV01_MEMORY_LOCAL_USER`, `NV01_MEMORY_VIRTUAL`), sync points and export/import memory (`NV01_MEMORY_SYNCPOINT`, `NV_MEMORY_EXPORT`, `NV_MEMORY_FABRIC`, `NV_MEMORY_MULTICAST_FABRIC`), and the memory mapper `NV_MEMORY_MAPPER` (lines 47-70).
-- Address spaces and context descriptors: GPU/Fabric/IO virtual address spaces (`FERMI_VASPACE_A`, `FABRIC_VASPACE_A`, `IO_VASPACE_A`, lines 68, 167) plus context DMA (`NV01_CONTEXT_DMA`) for describing access contexts.
+- Root/client sessions and device hierarchy: `NV01_ROOT`, `NV01_ROOT_CLIENT`, `NV0020_GPU_MANAGEMENT`, `NV01_DEVICE_0`, `NV20_SUBDEVICE_0`, and `NV2081_BINAPI`/`NV2082_BINAPI_PRIVILEGED` (lines 36-44).
+- Memory and mapping objects: system/local/user/physical/virtual memory classes (e.g., `NV01_MEMORY_SYSTEM`, `NV01_MEMORY_LOCAL_USER`, `NV01_MEMORY_VIRTUAL`), sync points and export/import memory (`NV01_MEMORY_SYNCPOINT`, `NV_MEMORY_EXPORT`, `NV_MEMORY_FABRIC`, `NV_MEMORY_MULTICAST_FABRIC`), and the memory mapper `NV_MEMORY_MAPPER` (lines 47-69).
+- Address spaces and context descriptors: GPU/Fabric/IO virtual address spaces (`FABRIC_VASPACE_A` line 68, `IO_VASPACE_A` line 70, `FERMI_VASPACE_A` line 167) plus context DMA (`NV01_CONTEXT_DMA` line 46) for describing access contexts.
 - Channel and engine execution resources: per-generation GPFIFO channels, user-mode interfaces, and copy/compute/graphics engine contexts (e.g., `KEPLER_CHANNEL_GPFIFO_A`, `HOPPER_CHANNEL_GPFIFO_A`, `DMA_COPY`, `*_COMPUTE_*`, lines 81-233) used to schedule graphics, compute, and DMA work.
 - Display, video, and multimedia units: display heads, window/cursor channels, VBlank callbacks, and video decode/encode/NVJPG/OFA engine classes (lines 101-199).
-- Synchronization and event/time objects: events, timers, semaphores, and event buffers (e.g., `NV01_EVENT`, `NV01_TIMER`, `NV_SEMAPHORE_SURFACE`, `NV_EVENT_BUFFER`, `GF100_TIMED_SEMAPHORE_SW`, lines 73, 161, 245, 249).
+- Synchronization and event/time objects: events, timers, semaphores, and event buffers (e.g., `NV01_EVENT` line 72, `NV01_TIMER` line 76, `GF100_TIMED_SEMAPHORE_SW` line 161, `NV_EVENT_BUFFER` line 245, `NV_SEMAPHORE_SURFACE` line 249).
 - Debug, performance, and telemetry: profilers, debug buffers, access-counter and MMU fault buffers (`GF100_PROFILER`, `MAXWELL_PROFILER`, `NV40_DEBUG_BUFFER`, `ACCESS_COUNTER_NOTIFY_BUFFER`, `MMU_FAULT_BUFFER`, lines 150-214).
 - Virtualization and security: VGPU device/config classes, confidential compute, and SMC partition monitoring (`KEPLER_DEVICE_VGPU`, `NVA081_VGPU_CONFIG`, `NV_CONFIDENTIAL_COMPUTE`, `AMPERE_SMC_*`, lines 223-228, 238-247).
 
